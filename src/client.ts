@@ -1,7 +1,7 @@
 // HakoBackend TypeScript client — port of the legacy rethink-firestore
 // `ui/src/lib/client.ts`, adapted to the hakobackend wire protocol:
 // native WebSocket `/ws` (no socket.io), PATCH-based merge, `{error}`
-// failure bodies, tenant/provisioning helpers, local-auth helpers.
+// failure bodies, local-auth helpers.
 //
 // Surface (classes, methods, constraints, snapshots) is intentionally
 // identical so consumer code migrates by changing imports.
@@ -799,26 +799,6 @@ export class HakoBackendClient {
       headers: this.headers
     });
     if (!response.ok) await throwForStatus(response, 'Failed to fetch profile');
-    return response.json();
-  }
-
-  // --- Tenants (admin) ---
-
-  async createTenant(slug: string) {
-    const response = await fetch(new URL('/api/tenants', BACKEND_URL).toString(), {
-      method: 'POST',
-      headers: this.headers,
-      body: JSON.stringify({ slug })
-    });
-    if (!response.ok) await throwForStatus(response, 'Failed to create tenant');
-    return response.json();
-  }
-
-  async listTenants(): Promise<string[]> {
-    const response = await fetch(new URL('/api/tenants', BACKEND_URL).toString(), {
-      headers: this.headers
-    });
-    if (!response.ok) await throwForStatus(response, 'Failed to list tenants');
     return response.json();
   }
 }

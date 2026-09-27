@@ -29,7 +29,7 @@ Set `VITE_BACKEND_URL` (Vite) or `NEXT_PUBLIC_BACKEND_URL` (Next.js).
 | `getSystemInfo()` → `{status, type}` | mapped from `{status, db}` |
 | aggregates | same calls; `count` reads `count_count` key |
 | Firebase token in `setIdentity` | any bearer token (local JWT, etc.) |
-| — | `+ register/login/logout/me` (local BFF), `createTenant/listTenants` (admin) |
+| — | `+ register/login/logout/me` (local BFF) |
 | — | `dispose()` to release the socket |
 
 `id` is required on batch/transaction ops (400 otherwise). Unknown batch
