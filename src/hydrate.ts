@@ -14,10 +14,18 @@ function isIsoDateString(val: string): boolean {
 }
 
 /**
- * High-Performance Client-Side Timestamp Hydrator.
- * Recursively inspects and injects toDate(), toMillis(), and toISOString() 
- * methods into any object containing ISO date strings or Date objects.
- * Optimized to prevent memory thrashing and CPU overhead on large lists (100+ items).
+ * Client-Side Timestamp Hydrator (pass-through).
+ *
+ * The backend serializes timestamps as ISO-8601 strings, and consumers
+ * treat them as strings (`Date.parse`, `new Date(...)`, lexicographic
+ * sorts) — so this function keeps them strings. An earlier revision
+ * replaced each ISO string with a `{ toDate, toMillis, toISOString }`
+ * object, which silently broke every string-treating consumer
+ * (`Date.parse` on the wrapper yields NaN; activity feeds dropped all
+ * entries). The wrapper is gone for good: ISO strings and Date
+ * instances pass through untouched, nested structures are traversed
+ * so the recursion keeps its call contract, and nothing is mutated
+ * (the original reference is returned).
  */
 export function hydrateTimestamps(data: any): any {
   if (!data || typeof data !== 'object' || data === null) return data;
@@ -31,40 +39,18 @@ export function hydrateTimestamps(data: any): any {
     return result;
   }
 
-  // Avoid cloning immediately; only mutate/clone if we actually find a date property
-  let cloned: any = null;
-
-  for (const key in data) {
-    if (!Object.prototype.hasOwnProperty.call(data, key)) continue;
-    
+  // Object.keys covers own enumerable props, so no hasOwnProperty guard needed.
+  for (const key of Object.keys(data)) {
     const val = data[key];
-    
-    if (typeof val === 'string') {
-      if (isIsoDateString(val)) {
-        if (!cloned) cloned = { ...data };
-        const date = new Date(val);
-        cloned[key] = {
-          toDate: () => date,
-          toMillis: () => date.getTime(),
-          toISOString: () => val
-        };
-      }
-    } else if (val instanceof Date) {
-      if (!cloned) cloned = { ...data };
-      cloned[key] = {
-        toDate: () => val,
-        toMillis: () => val.getTime(),
-        toISOString: () => val.toISOString()
-      };
-    } else if (typeof val === 'object' && val !== null) {
-      // If nested object has hydrated elements, update our cloned reference
-      const hydratedVal = hydrateTimestamps(val);
-      if (hydratedVal !== val) {
-        if (!cloned) cloned = { ...data };
-        cloned[key] = hydratedVal;
-      }
+    // ISO date strings and Date instances pass through untouched. Nested
+    // objects/arrays are traversed so the recursion stays consistent, but
+    // nothing is mutated (returns the original reference).
+    if (typeof val === 'string' && isIsoDateString(val)) continue;
+    if (typeof val === 'object' && val !== null) {
+      if (val instanceof Date) continue;
+      hydrateTimestamps(val);
     }
   }
 
-  return cloned || data;
+  return data;
 }

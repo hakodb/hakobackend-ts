@@ -34,3 +34,13 @@ Set `VITE_BACKEND_URL` (Vite) or `NEXT_PUBLIC_BACKEND_URL` (Next.js).
 
 `id` is required on batch/transaction ops (400 otherwise). Unknown batch
 `type` values are rejected — use `set/add/update/delete/get`.
+
+## Support matrix
+
+| Lib | Backend features covered |
+|---|---|
+| 0.1.x | core CRUD/queries/batch/tx/aggregates, WS realtime, local auth |
+| 0.2.x | + FieldValue/Timestamp sentinels, `?db=` (client default + per-ref/bulk override), managed files (`uploadFile`, `downloadFile`, `deleteFile`, `signFile`), `POST /api/indexes`, pass-through timestamp hydration |
+
+Timestamps stay ISO strings client-side (parseable); the old object-wrapper
+hydrator is gone — see `hydrate.test.ts` for the regression contract.
