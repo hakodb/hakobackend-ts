@@ -34,3 +34,50 @@ Set `VITE_BACKEND_URL` (Vite) or `NEXT_PUBLIC_BACKEND_URL` (Next.js).
 
 `id` is required on batch/transaction ops (400 otherwise). Unknown batch
 `type` values are rejected — use `set/add/update/delete/get`.
+
+## Support matrix
+
+| Lib | Backend features covered |
+|---|---|
+| 0.1.x | core CRUD/queries/batch/tx/aggregates, WS realtime, local auth |
+| 0.2.x | + FieldValue/Timestamp sentinels, `?db=`, managed files, `POST /api/indexes`, pass-through hydration |
+| 0.3.x | + token bridge, watch engine, React entry (`@hakodb/backend/react`) |
+
+Timestamps stay ISO strings client-side (parseable); the old object-wrapper
+hydrator is gone — see `hydrate.test.ts` for the regression contract.
+
+## React (`@hakodb/backend/react`)
+
+Framework-free core stays dependency-free; React is a peer dependency.
+
+```tsx
+import { HakoBackendClient } from "@hakodb/backend";
+import { HakoProvider, useCollection, useDoc } from "@hakodb/backend/react";
+import { bindTokenSource } from "@hakodb/backend";
+
+const client = new HakoBackendClient();
+
+// Any auth system plugs in via a token source (Firebase, local, OIDC —
+/// the lib never imports an auth SDK):
+const unbind = bindTokenSource(client, {
+  getToken: () => auth.currentUser?.getIdToken() ?? Promise.resolve(null),
+  subscribe: (cb) => auth.onAuthStateChanged(() => cb()),
+});
+
+function App() {
+  return (
+    <HakoProvider client={client}>
+      <Posts />
+    </HakoProvider>
+  );
+}
+
+function Posts() {
+  const { data, loading, error } = useCollection(client.collection("posts"));
+  // ...
+}
+```
+
+`useCollection(query | null)` and `useDoc(ref | null)` return
+`{ data, loading, error, snapshot }`. Concurrent identical subscriptions
+share one bootstrap fetch.

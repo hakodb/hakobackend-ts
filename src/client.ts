@@ -7,6 +7,8 @@
 // identical so consumer code migrates by changing imports.
 
 import { hydrateTimestamps } from "./hydrate";
+import { watchSnapshot } from "./watch";
+import type { SnapshotHost } from "./watch";
 
 const BACKEND_URL = (() => {
   // Vite apps: VITE_BACKEND_URL is inlined at build time.
@@ -68,6 +70,19 @@ export namespace Protocol {
  * TypeScript-first interfaces for Document Data
  */
 export type DocumentData = Record<string, any>;
+
+/** File metadata doc sub-object (managed files, `/api/files/*`). */
+export interface FileMeta {
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  state: 'ready' | 'pending';
+  createdAt?: string;
+  updatedAt?: string;
+  uploader?: string;
+  pendingSince?: number;
+}
 
 export interface FirestoreDataConverter<T> {
   toFirestore(modelObject: T): DocumentData;
@@ -155,7 +170,7 @@ export class CursorConstraint implements QueryConstraint {
  */
 class ConnectionManager {
   private socket: WebSocket | null = null;
-  private subscriptions: Map<string, { tableName: string; options: Protocol.QueryOptions | null; isGroup: boolean }> = new Map();
+  private subscriptions: Map<string, { tableName: string; options: Protocol.QueryOptions | null; isGroup: boolean; db: string }> = new Map();
   private listeners: Map<string, Set<(change: Protocol.ChangeEvent) => void>> = new Map();
   private identity: { token: string } | null = null;
   private isConnected: boolean = false;
@@ -171,7 +186,20 @@ class ConnectionManager {
     const url = this.identity?.token
       ? `${WS_URL}/ws?token=${encodeURIComponent(this.identity.token)}`
       : `${WS_URL}/ws`;
-    const ws = new WebSocket(url);
+    // ponytail: guard the constructor (not just the callbacks) — an empty
+    // base URL (tests, SSR, misconfig) throws synchronously here, which
+    // used to crash module scope. Degrade to disconnected + backoff.
+    let ws: WebSocket;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      this.isConnected = false;
+      if (!this.closed) {
+        setTimeout(() => this.connect(), this.reconnectDelay);
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, 10000);
+      }
+      return;
+    }
     this.socket = ws;
 
     ws.onopen = () => {
@@ -244,18 +272,20 @@ class ConnectionManager {
           collection: subscription.tableName,
           options: subscription.options || {},
           group: subscription.isGroup,
+          db: subscription.db,
           token: this.identity?.token,
         });
       });
     }
   }
 
-  subscribe(table: string, options: Protocol.QueryOptions | null, isGroup: boolean, callback: (change: Protocol.ChangeEvent) => void) {
+  subscribe(table: string, options: Protocol.QueryOptions | null, isGroup: boolean, callback: (change: Protocol.ChangeEvent) => void, db = 'default') {
     // Two live queries on the same collection with different filters must get
     // distinct server-side subscriptions, so include a stable options fingerprint
-    // in the key. The server treats this key as opaque.
-    const subscriptionKey = `${isGroup ? 'group:' : ''}${table}|${JSON.stringify(options || {})}`;
-    this.subscriptions.set(subscriptionKey, { tableName: table, options, isGroup });
+    // in the key. The server treats this key as opaque. The db joins the key:
+    // same collection in two databases are different feeds.
+    const subscriptionKey = `${isGroup ? 'group:' : ''}${db}|${table}|${JSON.stringify(options || {})}`;
+    this.subscriptions.set(subscriptionKey, { tableName: table, options, isGroup, db });
     let set = this.listeners.get(subscriptionKey);
     if (!set) {
       set = new Set();
@@ -268,6 +298,7 @@ class ConnectionManager {
       collection: table,
       options: options || {},
       group: isGroup,
+      db,
       token: this.identity?.token,
     });
 
@@ -280,34 +311,6 @@ class ConnectionManager {
       }
     };
   }
-}
-
-function compareDocs(a: any, b: any, orderBy: Protocol.OrderBy[]) {
-  const criteria = orderBy.length > 0 ? orderBy : [{ field: 'id', direction: 'asc' } as Protocol.OrderBy];
-
-  for (const { field, direction } of criteria) {
-    const valA = field.split('.').reduce((acc, part) => acc && acc[part], a);
-    const valB = field.split('.').reduce((acc, part) => acc && acc[part], b);
-
-    if (valA < valB) return direction === 'asc' ? -1 : 1;
-    if (valA > valB) return direction === 'asc' ? 1 : -1;
-  }
-  return 0;
-}
-
-function findInsertionIndex(array: any[], item: any, orderBy: Protocol.OrderBy[]): number {
-  let low = 0;
-  let high = array.length;
-
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    if (compareDocs(array[mid], item, orderBy) < 0) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  return low;
 }
 
 async function throwForStatus(response: Response, fallback: string): Promise<never> {
@@ -324,15 +327,47 @@ async function throwForStatus(response: Response, fallback: string): Promise<nev
 }
 
 /**
- * HakoBackend client (HTTP + native WebSocket).
+ * Build an API URL, appending `?db=` only for non-default databases
+ * (single-db URLs stay byte-identical to before). Pure (takes the base
+ * explicitly) so URL shaping is unit-testable without a client.
  */
+export function buildApiUrl(base: string, path: string, db?: string): URL {
+  const url = new URL(path, base);
+  if (db && db !== 'default') url.searchParams.append('db', db);
+  return url;
+}
 export class HakoBackendClient {
   private connection: ConnectionManager;
   private identity: { token: string } | null = null;
   private identityListeners: Array<() => void> = [];
+  /**
+   * Default database for every call (`?db=`). Single-db apps never touch
+   * this; multi-db apps set it per reference (`collection(name, db)`) or
+   * per bulk call — or point it once via `useDatabase`.
+   */
+  defaultDatabase = 'default';
 
   constructor() {
     this.connection = new ConnectionManager();
+  }
+
+  /** Point this client at another database (default for later calls). */
+  useDatabase(name: string) {
+    this.defaultDatabase = name;
+  }
+
+  /**
+   * Build an API URL, appending `?db=` only for non-default databases
+   * (single-db URLs stay byte-identical to before).
+   */
+  private apiUrl(path: string, db?: string): URL {
+    const name = db ?? this.defaultDatabase;
+    return buildApiUrl(BACKEND_URL || 'http://localhost', path, name);
+  }
+
+  /** Effective db: explicit override ?? reference db ?? client default. */
+  private dbOf(ref?: { db?: string }, override?: string): string {
+    return override ?? ref?.db ?? this.defaultDatabase;
   }
 
   /** Release the socket (apps with HMR / tests). */
@@ -367,16 +402,16 @@ export class HakoBackendClient {
     return h;
   }
 
-  collection<T = DocumentData>(name: string) {
-    return new CollectionReference<T>(this, name);
+  collection<T = DocumentData>(name: string, db?: string) {
+    return new CollectionReference<T>(this, name, null, db);
   }
 
-  collectionGroup<T = DocumentData>(name: string) {
-    return new Query<T>(new CollectionReference<T>(this, name), [], true);
+  collectionGroup<T = DocumentData>(name: string, db?: string) {
+    return new Query<T>(new CollectionReference<T>(this, name, null, db), [], true, db);
   }
 
-  doc<T = DocumentData>(collectionName: string, id: string) {
-    return new DocumentReference<T>(this, collectionName, id);
+  doc<T = DocumentData>(collectionName: string, id: string, db?: string) {
+    return new DocumentReference<T>(this, collectionName, id, db);
   }
 
   async getDocs<T = DocumentData>(q: Query<T> | CollectionReference<T>): Promise<QuerySnapshot<T>> {
@@ -384,7 +419,7 @@ export class HakoBackendClient {
     const options = queryObj.buildOptions();
     const baseUrl = queryObj.isGroup ? `/api/collectionGroup/${queryObj.colRef.name}` : `/api/collections/${queryObj.colRef.name}`;
 
-    const url = new URL(baseUrl, BACKEND_URL);
+    const url = this.apiUrl(baseUrl, queryObj.resolvedDb(this));
     url.searchParams.append('options', JSON.stringify(options));
 
     const response = await fetch(url.toString(), {
@@ -412,7 +447,7 @@ export class HakoBackendClient {
   }
 
   async getDoc<T = DocumentData>(docRef: DocumentReference<T>): Promise<DocumentSnapshot<T>> {
-    const url = new URL(`/api/collections/${docRef.collectionName}/${docRef.id}`, BACKEND_URL);
+    const url = this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}`, this.dbOf(docRef));
     const response = await fetch(url.toString(), {
       headers: this.headers
     });
@@ -439,153 +474,34 @@ export class HakoBackendClient {
     onNext: (snapshot: QuerySnapshot<T>) => void,
     onError?: (error: Error) => void
   ) {
+    // ponytail: the engine lives in watch.ts (testable behind a fake
+    // host); this method only binds the real client as the host.
     const queryObj = q instanceof CollectionReference ? new Query<T>(q) : q;
-    const options = queryObj.buildOptions();
-    const colName = queryObj.colRef.name;
+    return watchSnapshot(
+      this.host(),
+      queryObj,
+      queryObj.colRef.name,
+      queryObj.resolvedDb(this),
+      onNext,
+      onError,
+    );
+  }
 
-    let currentDocs: T[] = [];
-    let isInitial = true;
-    let loadSucceeded = false;
-    let pendingChanges: DocumentChange<T>[] = [];
-    let scheduleTimeoutId: any = null;
-
-    const flushBatch = () => {
-      if (pendingChanges.length === 0) return;
-
-      const deduplicatedChangesMap = new Map<string, DocumentChange<T>>();
-      pendingChanges.forEach((change) => {
-        deduplicatedChangesMap.set(change.doc.id, change);
-      });
-
-      const consolidatedChanges = Array.from(deduplicatedChangesMap.values());
-      const docsList = currentDocs.map((d: any) => {
-        const docRef = new DocumentReference<T>(queryObj.colRef.client, queryObj.colRef.name, d.id);
-        return new HakoBackendQueryDocumentSnapshot<T>(d.id, d, docRef);
-      });
-
-      onNext({
-        docs: docsList,
-        docChanges: () => consolidatedChanges,
-        empty: docsList.length === 0,
-        forEach(callback: (doc: QueryDocumentSnapshot<T>) => void, thisArg?: any) {
-          docsList.forEach(callback, thisArg);
-        }
-      });
-
-      pendingChanges = [];
-      scheduleTimeoutId = null;
-    };
-
-    const unsubscribe = this.connection.subscribe(colName, options, queryObj.isGroup, (change) => {
-      const { type, old_val, new_val } = change;
-      const docId = (new_val?.id || old_val?.id);
-      const oldIndex = currentDocs.findIndex((d: any) => (d as any).id === docId);
-
-      let docChange: DocumentChange<T> | null = null;
-      const docRef = new DocumentReference<T>(queryObj.colRef.client, queryObj.colRef.name, docId);
-
-      if (type === 'add' || (type === 'change' && oldIndex === -1)) {
-        const insertIndex = findInsertionIndex(currentDocs, new_val, options.orderBy);
-        currentDocs.splice(insertIndex, 0, new_val);
-
-        docChange = {
-          type: 'added',
-          doc: new HakoBackendQueryDocumentSnapshot<T>(docId, new_val, docRef),
-          oldIndex: -1,
-          newIndex: insertIndex
-        };
-      }
-      else if (type === 'remove' || (type === 'change' && new_val === null)) {
-        if (oldIndex !== -1) {
-          const removedDoc = currentDocs.splice(oldIndex, 1)[0];
-          docChange = {
-            type: 'removed',
-            doc: new HakoBackendQueryDocumentSnapshot<T>(docId, removedDoc, docRef),
-            oldIndex,
-            newIndex: -1
-          };
-        }
-      }
-      else if (type === 'change') {
-        if (oldIndex !== -1) {
-          currentDocs.splice(oldIndex, 1);
-          const newIndex = findInsertionIndex(currentDocs, new_val, options.orderBy);
-          currentDocs.splice(newIndex, 0, new_val);
-
-          docChange = {
-            type: 'modified',
-            doc: new HakoBackendQueryDocumentSnapshot<T>(docId, new_val, docRef),
-            oldIndex,
-            newIndex
-          };
-        }
-      }
-
-      if (!isInitial && docChange) {
-        pendingChanges.push(docChange);
-
-        if (!scheduleTimeoutId) {
-          const scheduler = typeof requestAnimationFrame !== 'undefined'
-            ? requestAnimationFrame
-            : (cb: any) => setTimeout(cb, 0);
-
-          scheduleTimeoutId = scheduler(flushBatch);
-        }
-      }
-    });
-
-    const loadInitial = () => {
-      return this.getDocs<T>(queryObj).then(snapshot => {
-        loadSucceeded = true;
-        currentDocs = snapshot.docs.map(d => d.data());
-        currentDocs.sort((a, b) => compareDocs(a, b, options.orderBy));
-        isInitial = false;
-
-        const docsList = currentDocs.map((d: any) => {
-          const docRef = new DocumentReference<T>(queryObj.colRef.client, queryObj.colRef.name, d.id);
-          return new HakoBackendQueryDocumentSnapshot<T>(d.id, d, docRef);
-        });
-
-        onNext({
-          docs: docsList,
-          docChanges: () => snapshot.docs.map((d, i) => ({
-            type: 'added',
-            doc: d,
-            oldIndex: -1,
-            newIndex: i
-          })),
-          empty: docsList.length === 0,
-          forEach(callback: (doc: QueryDocumentSnapshot<T>) => void, thisArg?: any) {
-            docsList.forEach(callback, thisArg);
-          }
-        });
-      }).catch(err => {
-        if (onError) onError(err);
-      });
-    };
-
-    loadInitial();
-
-    // If the initial fetch fired before the token was ready (e.g.
-    // right after a page refresh), it failed with 403 and left the snapshot
-    // empty. Refetch once the identity becomes available — but only if the
-    // first attempt didn't already succeed (avoids duplicate fetches on
-    // periodic token refreshes).
-    const refetchOnIdentity = () => {
-      if (!loadSucceeded) void loadInitial();
-    };
-    const stopListeningIdentity = this.onIdentityChange(refetchOnIdentity);
-
-    return () => {
-      stopListeningIdentity();
-      if (scheduleTimeoutId) {
-        if (typeof cancelAnimationFrame !== 'undefined') {
-          cancelAnimationFrame(scheduleTimeoutId);
-        } else {
-          clearTimeout(scheduleTimeoutId);
-        }
-      }
-      unsubscribe();
+  /**
+   * This client bound as a SnapshotHost (powers the react hooks and any
+   * custom watcher UI without touching the socket layer directly).
+   */
+  host(): SnapshotHost {
+    return {
+      getDocs: <U>(qq: Query<U> | CollectionReference<U>) => this.getDocs<U>(qq),
+      onIdentityChange: (cb: () => void) => this.onIdentityChange(cb),
+      subscribe: (
+        table: string,
+        options: Protocol.QueryOptions | null,
+        isGroup: boolean,
+        cb: (change: Protocol.ChangeEvent) => void,
+        db?: string,
+      ) => this.connection.subscribe(table, options, isGroup, cb, db),
     };
   }
 
@@ -593,7 +509,7 @@ export class HakoBackendClient {
     // hakobackend splits replace vs merge across methods (no ?merge= flag):
     // merge -> PATCH, otherwise PUT.
     const method = options.merge ? "PATCH" : "PUT";
-    const url = new URL(`/api/collections/${docRef.collectionName}/${docRef.id}`, BACKEND_URL);
+    const url = this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}`, this.dbOf(docRef));
 
     const response = await fetch(url.toString(), {
       method,
@@ -606,7 +522,7 @@ export class HakoBackendClient {
   }
 
   async addDoc<T = DocumentData>(colRef: CollectionReference<T>, data: T) {
-    const response = await fetch(new URL(`/api/collections/${colRef.name}`, BACKEND_URL).toString(), {
+    const response = await fetch(this.apiUrl(`/api/collections/${colRef.name}`, this.dbOf(colRef)).toString(), {
       method: "POST",
       headers: this.headers,
       body: JSON.stringify(data)
@@ -617,7 +533,7 @@ export class HakoBackendClient {
   }
 
   async updateDoc<T = DocumentData>(docRef: DocumentReference<T>, data: Partial<T>) {
-    const response = await fetch(new URL(`/api/collections/${docRef.collectionName}/${docRef.id}`, BACKEND_URL).toString(), {
+    const response = await fetch(this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}`, this.dbOf(docRef)).toString(), {
       method: "PATCH",
       headers: this.headers,
       body: JSON.stringify(data)
@@ -628,7 +544,7 @@ export class HakoBackendClient {
   }
 
   async deleteDoc<T = DocumentData>(docRef: DocumentReference<T>) {
-    const response = await fetch(new URL(`/api/collections/${docRef.collectionName}/${docRef.id}`, BACKEND_URL).toString(), {
+    const response = await fetch(this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}`, this.dbOf(docRef)).toString(), {
       method: "DELETE",
       headers: this.headers
     });
@@ -637,18 +553,19 @@ export class HakoBackendClient {
     return hydrateTimestamps(rawData);
   }
 
-  async indexCreate(collectionName: string, indexName: string, fields: string[]) {
-    const response = await fetch(new URL(`/api/collections/${collectionName}/index`, BACKEND_URL).toString(), {
+  async indexCreate(collectionName: string, indexName: string, fields: string[], db?: string) {
+    const response = await fetch(this.apiUrl('/api/indexes', db).toString(), {
       method: "POST",
       headers: this.headers,
-      body: JSON.stringify({ name: indexName, fields })
+      body: JSON.stringify({ collection: collectionName, name: indexName, fields })
     });
     if (!response.ok) await throwForStatus(response, `Failed to create index ${indexName} on ${collectionName}`);
     return response.json();
   }
 
-  writeBatch() {
+  writeBatch(db?: string) {
     const operations: Protocol.BatchOperation[] = [];
+    const targetDb = db ?? this.defaultDatabase;
     return {
       set: <T = DocumentData>(docRef: DocumentReference<T>, data: T, options: { merge?: boolean } = {}) => {
         operations.push({ type: 'set', collection: docRef.collectionName, id: docRef.id, data, options });
@@ -660,7 +577,7 @@ export class HakoBackendClient {
         operations.push({ type: 'delete', collection: docRef.collectionName, id: docRef.id });
       },
       commit: async () => {
-        const response = await fetch(new URL('/api/batch', BACKEND_URL).toString(), {
+        const response = await fetch(this.apiUrl('/api/batch', targetDb).toString(), {
           method: 'POST',
           headers: this.headers,
           body: JSON.stringify({ operations })
@@ -672,7 +589,7 @@ export class HakoBackendClient {
     };
   }
 
-  async runTransaction(updateFunction: (transaction: any) => Promise<any>) {
+  async runTransaction(updateFunction: (transaction: any) => Promise<any>, db?: string) {
     const operations: Protocol.BatchOperation[] = [];
     const transaction = {
       get: async <T = DocumentData>(docRef: DocumentReference<T>) => {
@@ -693,7 +610,7 @@ export class HakoBackendClient {
 
     const result = await updateFunction(transaction);
 
-    const response = await fetch(new URL('/api/transaction', BACKEND_URL).toString(), {
+    const response = await fetch(this.apiUrl('/api/transaction', db).toString(), {
       method: 'POST',
       headers: this.headers,
       body: JSON.stringify({ operations })
@@ -703,23 +620,23 @@ export class HakoBackendClient {
     return result;
   }
 
-  async getCountFromServer<T = DocumentData>(q: Query<T> | CollectionReference<T>) {
-    return this.aggregate(q, [{ type: 'count' }]);
+  async getCountFromServer<T = DocumentData>(q: Query<T> | CollectionReference<T>, db?: string) {
+    return this.aggregate(q, [{ type: 'count' }], db);
   }
 
-  async getSumFromServer<T = DocumentData>(q: Query<T> | CollectionReference<T>, field: string) {
-    return this.aggregate(q, [{ type: 'sum', field }]);
+  async getSumFromServer<T = DocumentData>(q: Query<T> | CollectionReference<T>, field: string, db?: string) {
+    return this.aggregate(q, [{ type: 'sum', field }], db);
   }
 
-  async getAverageFromServer<T = DocumentData>(q: Query<T> | CollectionReference<T>, field: string) {
-    return this.aggregate(q, [{ type: 'avg', field }]);
+  async getAverageFromServer<T = DocumentData>(q: Query<T> | CollectionReference<T>, field: string, db?: string) {
+    return this.aggregate(q, [{ type: 'avg', field }], db);
   }
 
-  private async aggregate<T = DocumentData>(q: Query<T> | CollectionReference<T>, aggregations: any[]) {
+  private async aggregate<T = DocumentData>(q: Query<T> | CollectionReference<T>, aggregations: any[], db?: string) {
     const queryObj = q instanceof CollectionReference ? new Query<T>(q) : q;
     const options = queryObj.buildOptions();
 
-    const response = await fetch(new URL(`/api/aggregate/${queryObj.colRef.name}`, BACKEND_URL).toString(), {
+    const response = await fetch(this.apiUrl(`/api/aggregate/${queryObj.colRef.name}`, db ?? queryObj.resolvedDb(this)).toString(), {
       method: 'POST',
       headers: this.headers,
       body: JSON.stringify({ options, aggregations })
@@ -737,16 +654,105 @@ export class HakoBackendClient {
     };
   }
 
-  async listCollections(): Promise<string[]> {
-    const response = await fetch(new URL('/api/collections', BACKEND_URL).toString(), {
+  // --- Managed files (/api/files/*): byte files + metadata docs.
+  // Metadata lives in the addressed collection; bytes are
+  // content-addressed server-side. See HTTP_CONTRACT §15.
+
+  async uploadFile(
+    collection: string,
+    id: string,
+    file: Blob,
+    opts: { field?: string; fileName?: string; db?: string } = {},
+  ): Promise<{ id: string; file: FileMeta }> {
+    const field = opts.field && opts.field !== 'file' ? `/${opts.field}` : '';
+    const form = new FormData();
+    form.append('file', file, opts.fileName ?? (file as File).name ?? 'upload');
+    const response = await fetch(this.apiUrl(`/api/files/${collection}/${id}${field}`, opts.db).toString(), {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: form,
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to upload file to ${collection}/${id}`);
+    return response.json();
+  }
+
+  async uploadFiles(
+    collection: string,
+    files: Blob[],
+    opts: { fileName?: (i: number) => string; db?: string } = {},
+  ): Promise<Array<{ id: string; file: FileMeta }>> {
+    const form = new FormData();
+    files.forEach((f, i) => form.append('file', f, opts.fileName?.(i) ?? (f as File).name ?? `upload-${i}`));
+    const response = await fetch(this.apiUrl(`/api/files/${collection}`, opts.db).toString(), {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: form,
+    });
+    if (!response.ok) await throwForStatus(response, `Failed batch upload to ${collection}`);
+    return response.json();
+  }
+
+  async downloadFile(
+    collection: string,
+    id: string,
+    opts: { field?: string; db?: string } = {},
+  ): Promise<Blob> {
+    const field = opts.field && opts.field !== 'file' ? `/${opts.field}` : '';
+    const response = await fetch(this.apiUrl(`/api/files/${collection}/${id}${field}`, opts.db).toString(), {
+      headers: this.authHeaders(),
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to download file ${collection}/${id}`);
+    return response.blob();
+  }
+
+  async deleteFile(
+    collection: string,
+    id: string,
+    opts: { field?: string; db?: string } = {},
+  ): Promise<{ ok: boolean }> {
+    const field = opts.field && opts.field !== 'file' ? `/${opts.field}` : '';
+    const response = await fetch(this.apiUrl(`/api/files/${collection}/${id}${field}`, opts.db).toString(), {
+      method: 'DELETE',
+      headers: this.authHeaders(),
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to delete file ${collection}/${id}`);
+    return response.json();
+  }
+
+  /** Mint a signed URL (relative; same-origin usable as-is). */
+  async signFile(
+    collection: string,
+    id: string,
+    expSecs: number,
+    opts: { field?: string; db?: string } = {},
+  ): Promise<{ url: string; exp: number }> {
+    const field = opts.field && opts.field !== 'file' ? `/${opts.field}` : '';
+    const url = this.apiUrl(`/api/files/${collection}/${id}${field}`, opts.db);
+    url.searchParams.append('sign', String(expSecs));
+    const response = await fetch(url.toString(), { headers: this.authHeaders() });
+    if (!response.ok) await throwForStatus(response, `Failed to sign file ${collection}/${id}`);
+    return response.json();
+  }
+
+  /** Authorization header only (multipart bodies set their own content type). */
+  private authHeaders(): HeadersInit {
+    const h: HeadersInit = {};
+    if (this.identity?.token) {
+      h["Authorization"] = `Bearer ${this.identity.token}`;
+    }
+    return h;
+  }
+
+  async listCollections(db?: string): Promise<string[]> {
+    const response = await fetch(this.apiUrl('/api/collections', db).toString(), {
       headers: this.headers
     });
     if (!response.ok) await throwForStatus(response, 'Failed to fetch collections');
     return response.json();
   }
 
-  async createCollection(name: string): Promise<{ success: boolean }> {
-    const response = await fetch(new URL('/api/collections', BACKEND_URL).toString(), {
+  async createCollection(name: string, db?: string): Promise<{ success: boolean }> {
+    const response = await fetch(this.apiUrl('/api/collections', db).toString(), {
       method: 'POST',
       headers: this.headers,
       body: JSON.stringify({ name })
@@ -812,13 +818,14 @@ export class CollectionReference<T = DocumentData> {
   constructor(
     public client: HakoBackendClient,
     public name: string,
-    public converter: FirestoreDataConverter<T> | null = null
+    public converter: FirestoreDataConverter<T> | null = null,
+    public db?: string
   ) {
     this.path = name;
   }
 
   withConverter<U>(converter: FirestoreDataConverter<U>): CollectionReference<U> {
-    return new CollectionReference<U>(this.client, this.name, converter);
+    return new CollectionReference<U>(this.client, this.name, converter, this.db);
   }
 }
 
@@ -829,7 +836,8 @@ export class DocumentReference<T = DocumentData> {
   constructor(
     public client: HakoBackendClient,
     public collectionName: string,
-    public id: string
+    public id: string,
+    public db?: string
   ) {
     this.path = collectionName ? `${collectionName}/${id}` : id;
   }
@@ -839,8 +847,14 @@ export class Query<T = DocumentData> {
   constructor(
     public colRef: CollectionReference<T>,
     public constraints: QueryConstraint[] = [],
-    public isGroup: boolean = false
+    public isGroup: boolean = false,
+    public db?: string
   ) {}
+
+  /** Effective database: query override ?? collection db (server default applies when unset). */
+  resolvedDb(client: HakoBackendClient): string {
+    return this.db ?? this.colRef.db ?? client.defaultDatabase;
+  }
 
   buildOptions(): Protocol.QueryOptions {
     const options: Protocol.QueryOptions = { filters: [], fields: [], orderBy: [] };
@@ -850,9 +864,10 @@ export class Query<T = DocumentData> {
 }
 
 /**
- * Snapshot Implementations
+ * Snapshot Implementations (exported for the watch engine + tests;
+ * consumers normally meet these through snapshots, not imports).
  */
-class HakoBackendDocumentSnapshot<T> implements DocumentSnapshot<T> {
+export class HakoBackendDocumentSnapshot<T> implements DocumentSnapshot<T> {
   constructor(
     public id: string,
     private _data: any | undefined,
@@ -871,7 +886,7 @@ class HakoBackendDocumentSnapshot<T> implements DocumentSnapshot<T> {
   }
 }
 
-class HakoBackendQueryDocumentSnapshot<T> extends HakoBackendDocumentSnapshot<T> implements QueryDocumentSnapshot<T> {
+export class HakoBackendQueryDocumentSnapshot<T> extends HakoBackendDocumentSnapshot<T> implements QueryDocumentSnapshot<T> {
   constructor(id: string, data: T, ref: DocumentReference<T>) {
     super(id, data, true, ref);
   }
