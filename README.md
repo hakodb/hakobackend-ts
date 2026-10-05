@@ -40,7 +40,8 @@ Set `VITE_BACKEND_URL` (Vite) or `NEXT_PUBLIC_BACKEND_URL` (Next.js).
 | Lib | Backend features covered |
 |---|---|
 | 0.1.x | core CRUD/queries/batch/tx/aggregates, WS realtime, local auth |
-| 0.2.x | + FieldValue/Timestamp sentinels, `?db=` (client default + per-ref/bulk override), managed files (`uploadFile`, `downloadFile`, `deleteFile`, `signFile`), `POST /api/indexes`, pass-through timestamp hydration |
+| 0.2.x | + FieldValue/Timestamp sentinels, `?db=`, managed files, `POST /api/indexes`, pass-through hydration |
+| 0.3.x | + token bridge, watch engine, React entry (`@hakodb/backend/react`) |
 
 Timestamps stay ISO strings client-side (parseable); the old object-wrapper
 hydrator is gone — see `hydrate.test.ts` for the regression contract.
