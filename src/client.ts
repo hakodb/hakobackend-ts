@@ -7,6 +7,8 @@
 // identical so consumer code migrates by changing imports.
 
 import { hydrateTimestamps } from "./hydrate";
+import { watchSnapshot } from "./watch";
+import type { SnapshotHost } from "./watch";
 
 const BACKEND_URL = (() => {
   // Vite apps: VITE_BACKEND_URL is inlined at build time.
@@ -311,34 +313,6 @@ class ConnectionManager {
   }
 }
 
-function compareDocs(a: any, b: any, orderBy: Protocol.OrderBy[]) {
-  const criteria = orderBy.length > 0 ? orderBy : [{ field: 'id', direction: 'asc' } as Protocol.OrderBy];
-
-  for (const { field, direction } of criteria) {
-    const valA = field.split('.').reduce((acc, part) => acc && acc[part], a);
-    const valB = field.split('.').reduce((acc, part) => acc && acc[part], b);
-
-    if (valA < valB) return direction === 'asc' ? -1 : 1;
-    if (valA > valB) return direction === 'asc' ? 1 : -1;
-  }
-  return 0;
-}
-
-function findInsertionIndex(array: any[], item: any, orderBy: Protocol.OrderBy[]): number {
-  let low = 0;
-  let high = array.length;
-
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    if (compareDocs(array[mid], item, orderBy) < 0) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  return low;
-}
-
 async function throwForStatus(response: Response, fallback: string): Promise<never> {
   let detail = fallback;
   try {
@@ -500,154 +474,34 @@ export class HakoBackendClient {
     onNext: (snapshot: QuerySnapshot<T>) => void,
     onError?: (error: Error) => void
   ) {
+    // ponytail: the engine lives in watch.ts (testable behind a fake
+    // host); this method only binds the real client as the host.
     const queryObj = q instanceof CollectionReference ? new Query<T>(q) : q;
-    const options = queryObj.buildOptions();
-    const colName = queryObj.colRef.name;
+    return watchSnapshot(
+      this.host(),
+      queryObj,
+      queryObj.colRef.name,
+      queryObj.resolvedDb(this),
+      onNext,
+      onError,
+    );
+  }
 
-    let currentDocs: T[] = [];
-    let isInitial = true;
-    let loadSucceeded = false;
-    let pendingChanges: DocumentChange<T>[] = [];
-    let scheduleTimeoutId: any = null;
-
-    const flushBatch = () => {
-      if (pendingChanges.length === 0) return;
-
-      const deduplicatedChangesMap = new Map<string, DocumentChange<T>>();
-      pendingChanges.forEach((change) => {
-        deduplicatedChangesMap.set(change.doc.id, change);
-      });
-
-      const consolidatedChanges = Array.from(deduplicatedChangesMap.values());
-      const docsList = currentDocs.map((d: any) => {
-        const docRef = new DocumentReference<T>(queryObj.colRef.client, queryObj.colRef.name, d.id);
-        return new HakoBackendQueryDocumentSnapshot<T>(d.id, d, docRef);
-      });
-
-      onNext({
-        docs: docsList,
-        docChanges: () => consolidatedChanges,
-        empty: docsList.length === 0,
-        forEach(callback: (doc: QueryDocumentSnapshot<T>) => void, thisArg?: any) {
-          docsList.forEach(callback, thisArg);
-        }
-      });
-
-      pendingChanges = [];
-      scheduleTimeoutId = null;
-    };
-
-    const db = queryObj.resolvedDb(this);
-    const unsubscribe = this.connection.subscribe(colName, options, queryObj.isGroup, (change) => {
-      const { type, old_val, new_val } = change;
-      const docId = (new_val?.id || old_val?.id);
-      const oldIndex = currentDocs.findIndex((d: any) => (d as any).id === docId);
-
-      let docChange: DocumentChange<T> | null = null;
-      const docRef = new DocumentReference<T>(queryObj.colRef.client, queryObj.colRef.name, docId);
-
-      if (type === 'add' || (type === 'change' && oldIndex === -1)) {
-        const insertIndex = findInsertionIndex(currentDocs, new_val, options.orderBy);
-        currentDocs.splice(insertIndex, 0, new_val);
-
-        docChange = {
-          type: 'added',
-          doc: new HakoBackendQueryDocumentSnapshot<T>(docId, new_val, docRef),
-          oldIndex: -1,
-          newIndex: insertIndex
-        };
-      }
-      else if (type === 'remove' || (type === 'change' && new_val === null)) {
-        if (oldIndex !== -1) {
-          const removedDoc = currentDocs.splice(oldIndex, 1)[0];
-          docChange = {
-            type: 'removed',
-            doc: new HakoBackendQueryDocumentSnapshot<T>(docId, removedDoc, docRef),
-            oldIndex,
-            newIndex: -1
-          };
-        }
-      }
-      else if (type === 'change') {
-        if (oldIndex !== -1) {
-          currentDocs.splice(oldIndex, 1);
-          const newIndex = findInsertionIndex(currentDocs, new_val, options.orderBy);
-          currentDocs.splice(newIndex, 0, new_val);
-
-          docChange = {
-            type: 'modified',
-            doc: new HakoBackendQueryDocumentSnapshot<T>(docId, new_val, docRef),
-            oldIndex,
-            newIndex
-          };
-        }
-      }
-
-      if (!isInitial && docChange) {
-        pendingChanges.push(docChange);
-
-        if (!scheduleTimeoutId) {
-          const scheduler = typeof requestAnimationFrame !== 'undefined'
-            ? requestAnimationFrame
-            : (cb: any) => setTimeout(cb, 0);
-
-          scheduleTimeoutId = scheduler(flushBatch);
-        }
-      }
-    }, db);
-
-    const loadInitial = () => {
-      return this.getDocs<T>(queryObj).then(snapshot => {
-        loadSucceeded = true;
-        currentDocs = snapshot.docs.map(d => d.data());
-        currentDocs.sort((a, b) => compareDocs(a, b, options.orderBy));
-        isInitial = false;
-
-        const docsList = currentDocs.map((d: any) => {
-          const docRef = new DocumentReference<T>(queryObj.colRef.client, queryObj.colRef.name, d.id);
-          return new HakoBackendQueryDocumentSnapshot<T>(d.id, d, docRef);
-        });
-
-        onNext({
-          docs: docsList,
-          docChanges: () => snapshot.docs.map((d, i) => ({
-            type: 'added',
-            doc: d,
-            oldIndex: -1,
-            newIndex: i
-          })),
-          empty: docsList.length === 0,
-          forEach(callback: (doc: QueryDocumentSnapshot<T>) => void, thisArg?: any) {
-            docsList.forEach(callback, thisArg);
-          }
-        });
-      }).catch(err => {
-        if (onError) onError(err);
-      });
-    };
-
-    loadInitial();
-
-    // If the initial fetch fired before the token was ready (e.g.
-    // right after a page refresh), it failed with 403 and left the snapshot
-    // empty. Refetch once the identity becomes available — but only if the
-    // first attempt didn't already succeed (avoids duplicate fetches on
-    // periodic token refreshes).
-    const refetchOnIdentity = () => {
-      if (!loadSucceeded) void loadInitial();
-    };
-    const stopListeningIdentity = this.onIdentityChange(refetchOnIdentity);
-
-    return () => {
-      stopListeningIdentity();
-      if (scheduleTimeoutId) {
-        if (typeof cancelAnimationFrame !== 'undefined') {
-          cancelAnimationFrame(scheduleTimeoutId);
-        } else {
-          clearTimeout(scheduleTimeoutId);
-        }
-      }
-      unsubscribe();
+  /**
+   * This client bound as a SnapshotHost (powers the react hooks and any
+   * custom watcher UI without touching the socket layer directly).
+   */
+  host(): SnapshotHost {
+    return {
+      getDocs: <U>(qq: Query<U> | CollectionReference<U>) => this.getDocs<U>(qq),
+      onIdentityChange: (cb: () => void) => this.onIdentityChange(cb),
+      subscribe: (
+        table: string,
+        options: Protocol.QueryOptions | null,
+        isGroup: boolean,
+        cb: (change: Protocol.ChangeEvent) => void,
+        db?: string,
+      ) => this.connection.subscribe(table, options, isGroup, cb, db),
     };
   }
 
@@ -1010,9 +864,10 @@ export class Query<T = DocumentData> {
 }
 
 /**
- * Snapshot Implementations
+ * Snapshot Implementations (exported for the watch engine + tests;
+ * consumers normally meet these through snapshots, not imports).
  */
-class HakoBackendDocumentSnapshot<T> implements DocumentSnapshot<T> {
+export class HakoBackendDocumentSnapshot<T> implements DocumentSnapshot<T> {
   constructor(
     public id: string,
     private _data: any | undefined,
@@ -1031,7 +886,7 @@ class HakoBackendDocumentSnapshot<T> implements DocumentSnapshot<T> {
   }
 }
 
-class HakoBackendQueryDocumentSnapshot<T> extends HakoBackendDocumentSnapshot<T> implements QueryDocumentSnapshot<T> {
+export class HakoBackendQueryDocumentSnapshot<T> extends HakoBackendDocumentSnapshot<T> implements QueryDocumentSnapshot<T> {
   constructor(id: string, data: T, ref: DocumentReference<T>) {
     super(id, data, true, ref);
   }
