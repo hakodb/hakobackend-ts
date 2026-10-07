@@ -563,6 +563,70 @@ export class HakoBackendClient {
     return response.json();
   }
 
+  /**
+   * Move docs between collections (archive/restore): timestamp-preserving
+   * put at dst first, fresh tombstone at src; returns {moved, missing}.
+   * Refusals (excluded sides, same-side) surface as thrown errors.
+   */
+  async relocateDocs(src: string, dst: string, ids: string[], db?: string): Promise<{ moved: string[]; missing: string[] }> {
+    const response = await fetch(this.apiUrl('/api/relocate', db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ src, dst, ids })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to relocate ${src} -> ${dst}`);
+    return response.json();
+  }
+
+  /** Explicit load of one (usually lazy archive) collection. */
+  async loadCollection(collectionName: string, db?: string) {
+    const response = await fetch(this.apiUrl('/api/collections/load', db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ collection: collectionName })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to load collection ${collectionName}`);
+    return response.json();
+  }
+
+  /** Explicit evict of one lazy collection (refuses non-lazy). */
+  async unloadCollection(collectionName: string, db?: string) {
+    const response = await fetch(this.apiUrl('/api/collections/unload', db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ collection: collectionName })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to unload collection ${collectionName}`);
+    return response.json();
+  }
+
+  /** Archive-group collections present but not loaded. */
+  async unloadedCollections(db?: string): Promise<string[]> {
+    const response = await fetch(this.apiUrl('/api/collections/unloaded', db).toString(), {
+      headers: this.headers
+    });
+    if (!response.ok) await throwForStatus(response, 'Failed to list unloaded collections');
+    return response.json();
+  }
+
+  /**
+   * Single-field read without fetching the whole doc: GET
+   * /api/collections/{coll}/{id}/{field.path}. Returns the raw JSON
+   * value (missing fields fall back to the legacy list shape server-side,
+   * so an empty array is ambiguous — check doc existence first when it
+   * matters). Dotted paths descend nested objects.
+   */
+  async getField<T = DocumentData>(docRef: DocumentReference<T>, fieldPath: string): Promise<any> {
+    const response = await fetch(this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}/${fieldPath}`, this.dbOf(docRef)).toString(), {
+      headers: this.headers
+    });
+    if (response.status === 404) {
+      return undefined;
+    }
+    if (!response.ok) await throwForStatus(response, `Failed to fetch field ${fieldPath} of ${docRef.id}`);
+    return hydrateTimestamps(await response.json());
+  }
+
   writeBatch(db?: string) {
     const operations: Protocol.BatchOperation[] = [];
     const targetDb = db ?? this.defaultDatabase;
