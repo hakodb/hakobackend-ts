@@ -564,6 +564,35 @@ export class HakoBackendClient {
   }
 
   /**
+   * Create a vector (KNN) index over a JSON number-array field.
+   * metric: 'cosine' (default) | 'l2'. dim 1..=4096.
+   */
+  async vectorIndexCreate(collectionName: string, field: string, dim: number, metric: 'cosine' | 'l2' = 'cosine', db?: string) {
+    const response = await fetch(this.apiUrl('/api/vector-index', db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ collection: collectionName, field, dim, metric })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to create vector index on ${collectionName}.${field}`);
+    return response.json();
+  }
+
+  /**
+   * KNN search: nearest-first [{id, score, doc}]. query is a plain
+   * number array (Float32Array works too — Array.from flattens it,
+   * since fetch bodies are JSON). Scores are exact metric distances.
+   */
+  async vectorSearch(collectionName: string, field: string, query: number[] | Float32Array, k = 10, metric: 'cosine' | 'l2' = 'cosine', db?: string): Promise<Array<{ id: string; score: number; doc: any }>> {
+    const response = await fetch(this.apiUrl(`/api/vector-search/${collectionName}`, db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ field, query: Array.from(query), k, metric })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed vector search on ${collectionName}.${field}`);
+    return response.json();
+  }
+
+  /**
    * Move docs between collections (archive/restore): timestamp-preserving
    * put at dst first, fresh tombstone at src; returns {moved, missing}.
    * Refusals (excluded sides, same-side) surface as thrown errors.
