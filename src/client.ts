@@ -473,9 +473,40 @@ export class HakoBackendClient {
     q: Query<T> | CollectionReference<T>,
     onNext: (snapshot: QuerySnapshot<T>) => void,
     onError?: (error: Error) => void
-  ) {
+  ): () => void;
+  onSnapshot<T = DocumentData>(
+    ref: DocumentReference<T>,
+    onNext: (snapshot: DocumentSnapshot<T>) => void,
+    onError?: (error: Error) => void
+  ): () => void;
+  onSnapshot<T = DocumentData>(
+    q: Query<T> | CollectionReference<T> | DocumentReference<T>,
+    onNext: (snapshot: any) => void,
+    onError?: (error: Error) => void
+  ): () => void {
     // ponytail: the engine lives in watch.ts (testable behind a fake
     // host); this method only binds the real client as the host.
+    if (q instanceof DocumentReference) {
+      // Doc watch = point query (id ==, limit 1), mapped to a doc
+      // snapshot (absent = exists:false). Same emulation consumers
+      // hand-rolled; now one generic overload.
+      const colRef = new CollectionReference<T>(q.client, q.collectionName, null, q.db);
+      const queryObj = new Query<T>(colRef, [
+        new WhereConstraint('id', '==', q.id),
+        new LimitConstraint(1),
+      ], false, q.db);
+      return watchSnapshot(
+        this.host(),
+        queryObj,
+        queryObj.colRef.name,
+        queryObj.resolvedDb(this),
+        (qs) => {
+          const hit = qs.docs.find((d) => d.id === q.id);
+          onNext(hit ?? new HakoBackendDocumentSnapshot<T>(q.id, undefined, false, q));
+        },
+        onError,
+      );
+    }
     const queryObj = q instanceof CollectionReference ? new Query<T>(q) : q;
     return watchSnapshot(
       this.host(),
