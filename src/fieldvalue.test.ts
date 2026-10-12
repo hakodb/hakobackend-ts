@@ -12,13 +12,22 @@ import {
 /** The `__type__` wire shapes the backend resolves gateway-side. */
 describe('FieldValue', () => {
   it('emits the documented sentinel shapes', () => {
-    expect(serverTimestamp()).toEqual({ __type: 'serverTimestamp' });
-    expect(increment(2)).toEqual({ __type: 'increment', n: 2 });
-    expect(arrayUnion('a', 'b')).toEqual({ __type: 'arrayUnion', elements: ['a', 'b'] });
-    expect(arrayRemove('a')).toEqual({ __type: 'arrayRemove', elements: ['a'] });
-    expect(deleteField()).toEqual({ __type: 'deleteField' });
+    expect(serverTimestamp()).toEqual({ __type__: 'serverTimestamp' });
+    expect(increment(2)).toEqual({ __type__: 'increment', n: 2 });
+    expect(arrayUnion('a', 'b')).toEqual({ __type__: 'arrayUnion', elements: ['a', 'b'] });
+    expect(arrayRemove('a')).toEqual({ __type__: 'arrayRemove', elements: ['a'] });
+    expect(deleteField()).toEqual({ __type__: 'deleteField' });
     // Bound consts are the same factories.
     expect(FieldValue.serverTimestamp()).toEqual(serverTimestamp());
+  });
+
+  it('uses the exact key the gateway checks (atomics.rs is_sentinel)', () => {
+    // Regression for the single-underscore bug: sentinels with `__type`
+    // stored as plain data, silently. Every factory must key `__type__`.
+    for (const s of [serverTimestamp(), increment(1), arrayUnion(1), arrayRemove(1), deleteField()] as any[]) {
+      expect(Object.keys(s)).toContain('__type__');
+      expect(Object.keys(s)).not.toContain('__type');
+    }
   });
 });
 

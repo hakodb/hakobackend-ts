@@ -8,23 +8,23 @@
 /** Atomic-operation sentinel factory (mirrors Firestore's FieldValue). */
 export class FieldValue {
   static increment(n: number) {
-    return { __type: 'increment', n };
+    return { __type__: 'increment', n };
   }
 
   static arrayUnion(...elements: unknown[]) {
-    return { __type: 'arrayUnion', elements };
+    return { __type__: 'arrayUnion', elements };
   }
 
   static arrayRemove(...elements: unknown[]) {
-    return { __type: 'arrayRemove', elements };
+    return { __type__: 'arrayRemove', elements };
   }
 
   static serverTimestamp() {
-    return { __type: 'serverTimestamp' };
+    return { __type__: 'serverTimestamp' };
   }
 
   static delete() {
-    return { __type: 'deleteField' };
+    return { __type__: 'deleteField' };
   }
 }
 
