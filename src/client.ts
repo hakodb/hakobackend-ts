@@ -639,15 +639,29 @@ export class HakoBackendClient {
   /**
    * Graph BFS from a doc: [{collection, id, depth, doc}] in walk order.
    * direction: 'outgoing' (default) | 'incoming' | 'both'; edge null =
-   * any ref field.
+   * any ref field. Phase B: via (edge collection) + weight (numeric
+   * prop) switch to cost-ordered Dijkstra; hits carry cost.
    */
-  async traverseSearch(collectionName: string, startId: string, direction: 'outgoing' | 'incoming' | 'both' = 'outgoing', edge: string | null = null, maxDepth = 10, k = 100, db?: string): Promise<Array<{ collection: string; id: string; depth: number; doc: any }>> {
+  async traverseSearch(collectionName: string, startId: string, direction: 'outgoing' | 'incoming' | 'both' = 'outgoing', edge: string | null = null, maxDepth = 10, k = 100, via: string | null = null, weight: string | null = null, db?: string): Promise<Array<{ collection: string; id: string; depth: number; cost?: number; doc: any }>> {
     const response = await fetch(this.apiUrl(`/api/traverse-search/${collectionName}`, db).toString(), {
       method: "POST",
       headers: this.headers,
-      body: JSON.stringify({ start_id: startId, direction, edge, max_depth: maxDepth, k })
+      body: JSON.stringify({ start_id: startId, direction, edge, max_depth: maxDepth, k, via, weight })
     });
     if (!response.ok) await throwForStatus(response, `Failed traverse search on ${collectionName}/${startId}`);
+    return response.json();
+  }
+
+  /**
+   * Register an edge collection (tracks it + `_from`/`_to` lookup).
+   */
+  async edgeIndexCreate(collectionName: string, db?: string) {
+    const response = await fetch(this.apiUrl('/api/edge-index', db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ collection: collectionName })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to create edge index on ${collectionName}`);
     return response.json();
   }
 
