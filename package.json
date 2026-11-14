@@ -1,7 +1,11 @@
 {
   "name": "@hakodb/backend",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "HakoBackend TypeScript client: Firestore-shaped API over the hakobackend HTTP + WebSocket wire protocol",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hakodb/hakobackend-ts.git"
+  },
   "license": "MIT",
   "type": "module",
   "main": "src/index.ts",
