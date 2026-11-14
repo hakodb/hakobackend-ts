@@ -1,0 +1,36 @@
+# Publish via npm trusted publishing (OIDC) — no long-lived token.
+# The package must be configured on npmjs.com: Trusted Publisher =
+# GitHub Actions, owner hakodb, this repo, workflow publish.yml.
+# Tag discipline: bump the version on main via PR, merge, then push v*.
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: install
+        run: npm ci
+
+      - name: typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+
+      - name: publish
+        run: npm publish --access public
