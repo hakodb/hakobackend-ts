@@ -84,6 +84,19 @@ export interface FileMeta {
   pendingSince?: number;
 }
 
+/** Soft-delete retention record (GET /api/admin/restore-available and
+ * /api/admin/delete-queue). Times are Unix seconds. */
+export interface RestoreRecord {
+  col: string;
+  id: string;
+  /** Unix seconds when the delete happened. */
+  deleted_at: number;
+  /** Unix seconds when the sweeper may purge the record. */
+  scheduled_at: number;
+  /** Encoded payload size in bytes. */
+  bytes: number;
+}
+
 export interface FirestoreDataConverter<T> {
   toFirestore(modelObject: T): DocumentData;
   fromFirestore(snapshot: QueryDocumentSnapshot<DocumentData>): T;
@@ -574,8 +587,12 @@ export class HakoBackendClient {
     return hydrateTimestamps(rawData);
   }
 
-  async deleteDoc<T = DocumentData>(docRef: DocumentReference<T>) {
-    const response = await fetch(this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}`, this.dbOf(docRef)).toString(), {
+  async deleteDoc<T = DocumentData>(docRef: DocumentReference<T>, options?: { force?: boolean }) {
+    const url = this.apiUrl(`/api/collections/${docRef.collectionName}/${docRef.id}`, this.dbOf(docRef));
+    // ?mode=force (issue #63): legacy hard delete — skips the soft-delete
+    // retention/restore window. Soft (tombstone) is the default.
+    if (options?.force) url.searchParams.append('mode', 'force');
+    const response = await fetch(url.toString(), {
       method: "DELETE",
       headers: this.headers
     });
@@ -971,6 +988,102 @@ export class HakoBackendClient {
       headers: this.headers
     });
     if (!response.ok) await throwForStatus(response, 'Failed to fetch profile');
+    return response.json();
+  }
+
+  // --- Admin (is_admin-gated; same Bearer token) ---
+
+  /** Soft-delete retention record: what was deleted, when, and when the
+   * sweeper may purge it. `collection` scopes the list; omit for all. */
+  async restoreAvailable(collection?: string, db?: string): Promise<RestoreRecord[]> {
+    const url = this.apiUrl('/api/admin/restore-available', db);
+    if (collection) url.searchParams.append('collection', collection);
+    const response = await fetch(url.toString(), { headers: this.headers });
+    if (!response.ok) await throwForStatus(response, 'Failed to list restorable documents');
+    return response.json();
+  }
+
+  /** Soft-deleted docs due for the sweeper purge. `collection` scopes the
+   * list; omit for all. */
+  async deleteQueue(collection?: string, db?: string): Promise<RestoreRecord[]> {
+    const url = this.apiUrl('/api/admin/delete-queue', db);
+    if (collection) url.searchParams.append('collection', collection);
+    const response = await fetch(url.toString(), { headers: this.headers });
+    if (!response.ok) await throwForStatus(response, 'Failed to list the delete queue');
+    return response.json();
+  }
+
+  /** Undo a soft delete (409 when a policy cancel-rule rejects it,
+   * 404 when no retention record exists). Returns the live doc. */
+  async restoreDoc(collection: string, id: string, db?: string): Promise<DocumentData> {
+    const response = await fetch(this.apiUrl('/api/admin/restore', db).toString(), {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify({ collection, id })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to restore ${collection}/${id}`);
+    return hydrateTimestamps(await response.json());
+  }
+
+  /** Run one sweeper pass now: purge tombstones past their window.
+   * Returns the purged record count. */
+  async sweepNow(): Promise<{ purged: number }> {
+    const response = await fetch(this.apiUrl('/api/admin/sweep').toString(), {
+      method: 'POST',
+      headers: this.headers
+    });
+    if (!response.ok) await throwForStatus(response, 'Failed to run the sweeper');
+    return response.json();
+  }
+
+  /** Effective config snapshot (paths, public config, secret presence). */
+  async adminConfig(): Promise<any> {
+    const response = await fetch(this.apiUrl('/api/admin/config').toString(), { headers: this.headers });
+    if (!response.ok) await throwForStatus(response, 'Failed to fetch admin config');
+    return response.json();
+  }
+
+  /** Read one `__backend` config section (`policy` | `aliases` |
+   * `service`): 404 when not set. Values are audited server-side. */
+  async getBackendSection(section: 'policy' | 'aliases' | 'service', db?: string): Promise<DocumentData | null> {
+    const response = await fetch(this.apiUrl(`/api/admin/backend/${section}`, db).toString(), { headers: this.headers });
+    if (response.status === 404) return null;
+    if (!response.ok) await throwForStatus(response, `Failed to read __backend/${section}`);
+    return response.json();
+  }
+
+  /** Write one `__backend` config section (validated at write time).
+   * policy: `{ toml }`; aliases: `{ decl: [...] }`; service: `{ keys }`.
+   * Apply afterwards with reload(). */
+  async putBackendSection(section: 'policy' | 'aliases' | 'service', doc: DocumentData, db?: string) {
+    const response = await fetch(this.apiUrl(`/api/admin/backend/${section}`, db).toString(), {
+      method: 'PUT',
+      headers: this.headers,
+      body: JSON.stringify(doc)
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to store __backend/${section}`);
+    return response.json();
+  }
+
+  /** Roll back one `__backend` config section: the next reload falls back
+   * to the config file's value for that section. */
+  async deleteBackendSection(section: 'policy' | 'aliases' | 'service', db?: string) {
+    const response = await fetch(this.apiUrl(`/api/admin/backend/${section}`, db).toString(), {
+      method: 'DELETE',
+      headers: this.headers
+    });
+    if (!response.ok) await throwForStatus(response, `Failed to remove __backend/${section}`);
+    return response.json();
+  }
+
+  /** Hot-reload: applies `__backend` sections over the config file.
+   * Failure = 400 with the old config fully retained. */
+  async reload(): Promise<{ success: boolean }> {
+    const response = await fetch(this.apiUrl('/api/admin/reload').toString(), {
+      method: 'POST',
+      headers: this.headers
+    });
+    if (!response.ok) await throwForStatus(response, 'Failed to reload');
     return response.json();
   }
 }
