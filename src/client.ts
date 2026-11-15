@@ -615,11 +615,11 @@ export class HakoBackendClient {
    * Create a vector (KNN) index over a JSON number-array field.
    * metric: 'cosine' (default) | 'l2'. dim 1..=4096.
    */
-  async vectorIndexCreate(collectionName: string, field: string, dim: number, metric: 'cosine' | 'l2' = 'cosine', db?: string) {
+  async vectorIndexCreate(collectionName: string, field: string, dim: number, metric: 'cosine' | 'l2' = 'cosine', db?: string, binaryStage1 = false) {
     const response = await fetch(this.apiUrl('/api/vector-index', db).toString(), {
       method: "POST",
       headers: this.headers,
-      body: JSON.stringify({ collection: collectionName, field, dim, metric })
+      body: JSON.stringify({ collection: collectionName, field, dim, metric, binary_stage1: binaryStage1 })
     });
     if (!response.ok) await throwForStatus(response, `Failed to create vector index on ${collectionName}.${field}`);
     return response.json();
@@ -679,6 +679,63 @@ export class HakoBackendClient {
       body: JSON.stringify({ collection: collectionName })
     });
     if (!response.ok) await throwForStatus(response, `Failed to create edge index on ${collectionName}`);
+    return response.json();
+  }
+
+  /**
+   * Hybrid retrieval: FTS (sparse) + KNN (dense) fused with Reciprocal
+   * Rank Fusion. Rows [{id, score (fused, desc), doc}]. rrfK 0 = engine
+   * default 60. Needs an FTS index + a vector index on the collection.
+   */
+  async hybridSearch(collectionName: string, textField: string, textQuery: string, vecField: string, query: number[] | Float32Array, k = 10, rrfK = 0, db?: string): Promise<Array<{ id: string; score: number; doc: any }>> {
+    const response = await fetch(this.apiUrl(`/api/hybrid-search/${collectionName}`, db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ text_field: textField, text_query: textQuery, vec_field: vecField, query: Array.from(query), k, rrf_k: rrfK })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed hybrid search on ${collectionName}`);
+    return response.json();
+  }
+
+  /**
+   * Personalized PageRank: teleport mass `1 - damping` on the seed set
+   * (seeds = ["col/id"] or [] for classic PageRank). damping 0 = engine
+   * default 0.85; top 0 = all nodes. Rows [{node, score}] score desc.
+   */
+  async graphPagerank(collectionName: string, seeds: string[] = [], opts: { direction?: 'outgoing' | 'incoming' | 'both'; edge?: string; via?: string; damping?: number; top?: number } = {}, db?: string): Promise<Array<{ node: string; score: number }>> {
+    const response = await fetch(this.apiUrl(`/api/graph-pagerank/${collectionName}`, db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({
+        seeds,
+        direction: opts.direction ?? 'outgoing',
+        edge: opts.edge ?? null,
+        via: opts.via ?? null,
+        damping: opts.damping ?? 0,
+        top: opts.top ?? 0
+      })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed pagerank on ${collectionName}`);
+    return response.json();
+  }
+
+  /**
+   * Seed-scoped N-hop subgraph: `{nodes, edges}` around one seed (same
+   * shape as a graph export). maxDepth = hop cap (default 10).
+   */
+  async subgraph(collectionName: string, seedId: string, opts: { direction?: 'outgoing' | 'incoming' | 'both'; edge?: string; via?: string; maxDepth?: number } = {}, db?: string): Promise<{ nodes: any[]; edges: any[] }> {
+    const response = await fetch(this.apiUrl(`/api/subgraph/${collectionName}`, db).toString(), {
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({
+        seed_id: seedId,
+        direction: opts.direction ?? 'outgoing',
+        edge: opts.edge ?? null,
+        via: opts.via ?? null,
+        max_depth: opts.maxDepth ?? 10
+      })
+    });
+    if (!response.ok) await throwForStatus(response, `Failed subgraph on ${collectionName}/${seedId}`);
     return response.json();
   }
 
