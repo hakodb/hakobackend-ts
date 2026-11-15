@@ -27,7 +27,7 @@ describe('vector SDK', () => {
       expect(calls).toHaveLength(1);
       expect(calls[0].url).toContain('/api/vector-index');
       expect(calls[0].init.method).toBe('POST');
-      expect(JSON.parse(calls[0].init.body)).toEqual({ collection: 'pts', field: 'emb', dim: 2, metric: 'cosine' });
+      expect(JSON.parse(calls[0].init.body)).toEqual({ collection: 'pts', field: 'emb', dim: 2, metric: 'cosine', binary_stage1: false });
     } finally {
       client.dispose();
     }
